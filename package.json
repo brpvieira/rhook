@@ -1,0 +1,22 @@
+{
+  "author": "Bernardo Vieira (http://github.com/brpvieira)",
+  "name": "rhook",
+  "description": "Minimal hook.io replacement that uses redis as a message bus",
+  "version": "0.0.1",
+  "homepage": "http://github.com/brpvieira/rhook",
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/brpvieira/rhook.git"
+  },
+  "main": "lib/rhook.js",
+  "dependencies": {
+    "redis" : "*",
+    "eventemitter2" : "*",
+    "async": "*",
+    "underscore": "*"
+  },
+  "devDependencies": {
+    "coffee-script": "*",
+    "watchit":"*"
+  }
+}
