@@ -39,7 +39,7 @@ class Hook extends EventEmitter2
         )
 
 
-        @_subscriber.on('error', (err) ->
+        @_subscriber.on('error', (err) =>
             @_emit('subscribererror', err)
         )
 
