@@ -1,7 +1,7 @@
 redis = require('redis')
 EventEmitter2 = require('eventemitter2').EventEmitter2
 _ = require('underscore')
-async = require('async')
+A = require('async')
 
 class Hook extends EventEmitter2
     constructor: (config) ->
@@ -12,53 +12,32 @@ class Hook extends EventEmitter2
             auth: false
             host: null
             port: null
-            redisOptions: null
+            redisOptions:
+                retry_max_delay: 1000
 
         @config = _.defaults(config,defaults)
         @config.newListener = false
+
+        for handler in _.functions(@)
+            do (handler) =>
+                @[handler] = _.bind(@[handler], @) if handler.indexOf('_on') == 0
+
+        @_watchForReadyState = _.bind(@_watchForReadyState, @)
+
+        Object.defineProperty(@, "_publisherReady", {
+            get: () =>
+                return false unless @_publisher
+                return @_publisher.connected
+        })
+
+
+        Object.defineProperty(@, "_subscriberReady", {
+            get: () =>
+                return false unless @_subscriber && @_subscriber.connected
+                return @_subscriber.subscription_set["sub #{@config.channel}"]
+        })
+
         super(_.pick(@config, 'wildcard', 'delimiter', 'newListener'))
-
-    _bindSubscriberEvents: () ->
-        @_subscriber.on('subscribe', (channel, count) =>
-            @_subscriber.on('message', (channel, msg) =>
-                @_onMessage(channel, msg)
-            )
-            @_emit('subscribe', channel, count)
-        )
-
-        @_subscriber.on('unsubscribe', (channel, count) =>
-            @_emit('unsubscribe'. channel, count)
-        )
-
-        @_subscriber.on('ready', () =>
-            @_subscriber.subscribe(@config.channel)
-        )
-
-        @_subscriber.on('end', () =>
-            @_emit('subscriberend')
-        )
-
-
-        @_subscriber.on('error', (err) =>
-            @_emit('subscribererror', err)
-        )
-
-    _bindPublisherEvents: () ->
-        @_publisher.on('ready', () =>
-            @_emit('publisherready')
-        )
-
-        @_publisher.on('end', () =>
-            @_emit('publisherend')
-        )
-
-        @_publisher.on('error', (err) =>
-            @_publisherReady = false
-            @_emit('publishererror', err)
-        )
-
-    _emit: () ->
-        EventEmitter2.prototype.emit.apply(@, arguments)
 
     emit: (name, data) ->
         return @_emit(arguments...) if name == "newListener"
@@ -72,6 +51,36 @@ class Hook extends EventEmitter2
         })
         @_publisher.publish(@config.channel, eventData)
 
+    _watchForReadyState: () ->
+        return if @_isWatching
+        @_isWatching = true
+        doNothing = (cb) -> setTimeout(cb, 100)
+        testFn = () -> @_publisherReady and @_subscriberReady
+        doneFn = () ->
+            @_isWatching = false
+            @_emit("hook#{@config.delimiter}ready")
+        
+        A.until(_.bind(testFn,@), doNothing, _.bind(doneFn, @))
+
+    start: () ->
+        @_watchForReadyState()
+        @_initPublisher()
+        @_initSubscriber()
+
+    
+
+    #
+    # Subscriber event handlers
+    #
+    _onSubscribe: (channel, count) ->
+        @_emit('subscribe', channel, count)
+
+    _onUnsubscribe: (channel, count) ->
+        @_emit('unsubscribe'. channel, count)
+
+    _onSubscriberReady: () ->
+        @_subscriber.subscribe(@config.channel)
+
     _onMessage: (channel, msg) ->
         return false if channel != @config.channel
         {source, version, name, data} = JSON.parse(msg)
@@ -79,72 +88,75 @@ class Hook extends EventEmitter2
         return false if source == @config.name
         @_emit("#{source}#{@config.delimiter}#{name}", data)
 
-    _initPublisher: (cb) ->
-        return cb(null, @_publisher) if @_publisherReady
+    _onSubscriberEnd: () ->
+        @_emit('subscriberend')
+            
+    _onSubscriberError: (err) ->
+        @_emit('subscribererror', err)
+        @_onConnectionError(err)
+
+    #
+    # Publisher event handlers
+    #
+    _onPublisherReady: () ->
+        @_emit('publisherready')
+    
+        
+    _onPublisherEnd: () ->
+        @_emit('publisherend')
+
+    _onPublisherError: (err) ->
+        @_emit('publishererror', err)
+        @_onConnectionError(err)
+
+    #
+    # General error handler
+    #
+    _onConnectionError: (err) ->
+        @_watchForReadyState()
+        retryCount = Math.max(@_subscriber.attempts, @_publisher.attempts)
+        retryDelay = Math.max(@_subscriber.retry_delay, @_publisher.retry_delay)
+        @_emit('connectionerror', err, retryCount, retryDelay)
+    
+    _bindSubscriberEvents: () ->
+        @_subscriber.on('message', @_onMessage)
+        @_subscriber.on('subscribe', @_onSubscribe)
+        @_subscriber.on('unsubscribe', @_onUnsubscribe)
+        @_subscriber.on('ready', @_onSubscriberReady)
+        @_subscriber.on('end', @_onSubscriberEnd)
+        @_subscriber.on('error', @_onSubscriberError)
+
+    _bindPublisherEvents: () ->
+        @_publisher.on('ready', @_onPublisherReady)
+        @_publisher.on('end', @_onPublisherEnd)
+        @_publisher.on('error', @_onPublisherError)
+
+    _emit: () ->
+        EventEmitter2.prototype.emit.apply(@, arguments)
+    
+    _initPublisher: () ->
+        return @_publisher if @_publisherReady
 
         @_publisher = redis.createClient(@config.port, @config.host,@config.redisOptions)
-        @_publisher.auth(@config.auth) if @config.auth
         @_bindPublisherEvents()
+        @_publisher.auth(@config.auth) if @config.auth
+        return @_publisher
 
-        errorHandler = (err) =>
-            @_publisherReady = false
-            @off('publisherready', successHandler)
-            cb(err)
-
-        successHandler = () =>
-            @_publisherReady = true
-            @off('publishererror', errorHandler)
-            cb(null, @_publisher)
-
-        @once('publishererror', errorHandler)
-        @once('publisherready', successHandler)
-
-    _initSubscriber: (cb) ->
-        return cb(null, @_subscriber) if @_subscriberReady
+    _initSubscriber: () ->
+        return @_subscriber if @_subscriberReady
 
         @_subscriber = redis.createClient(@config.port, @config.host,@config.redisOptions)
-        @_subscriber.auth(@config.auth) if @config.auth
         @_bindSubscriberEvents()
+        @_subscriber.auth(@config.auth) if @config.auth
 
-        errorHandler = (err) =>
-            @_subscriberReady = false
-            @off('subscribe', successHandler)
-            cb(err)
+        return @_subscriber
 
-        successHandler = () =>
-            @_subscriberReady = true
-            @off('subscriberrerror', errorHandler)
-            cb(null, @_subscriber)
-
-        @once('subscriberrerror', errorHandler)
-        @once('subscribe', successHandler)
-
-    _resetClientsAndEmitConnectionEnd: () ->
+    _resetClients: () ->
         @_publisherReady = false
         @_subscriberReady = false
-        @_publisher = null
-        @_subscriber = null
-        @_emit("hook#{@config.delimiter}connection#{@config.delimiter}end")
 
-    _onSubscriberEnd: () ->
-        @off('publisherend', @_onPubliserEnd)
-        @_publisher.end()
-        @_resetClientsAndEmitConnectionEnd()
 
-    _onPubliserEnd: () ->
-        @off('subscriberend', @_onSubscriberEnd)
-        @_subscriber.end()
-        @_resetClientsAndEmitConnectionEnd()
-
-    start: () ->
-        async.parallel([
-            (cb) => @_initPublisher(cb)
-            (cb) => @_initSubscriber(cb)
-        ],(err, results) =>
-            return @_emit('error', err) if err?
-            @_emit("hook#{@config.delimiter}ready")
-            @once('publisherend', () => @_onPubliserEnd())
-            @once('subscriberend', () => @_onSubscriberEnd())
-        )
 
 module.exports = { Hook }
+
+
